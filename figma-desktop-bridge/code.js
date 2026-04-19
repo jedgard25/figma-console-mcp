@@ -7,11 +7,14 @@
 // Plugin version — sent in FILE_INFO for server-side version compatibility checks.
 // The server compares this against its own version to detect stale cached plugins.
 var PLUGIN_VERSION = '1.14.0';
+var PLUGIN_SESSION_ID = 'plugin_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+var DEFAULT_UI_WIDTH = 320;
+var DEFAULT_UI_HEIGHT = 170;
 
 console.log('🌉 [Desktop Bridge] Plugin loaded (v' + PLUGIN_VERSION + ')');
 
 // Show minimal UI - compact status indicator
-figma.showUI(__html__, { width: 140, height: 50, visible: true, themeColors: true });
+figma.showUI(__html__, { width: DEFAULT_UI_WIDTH, height: DEFAULT_UI_HEIGHT, visible: true, themeColors: true });
 
 // ============================================================================
 // CONSOLE CAPTURE — Intercept console.* in the QuickJS sandbox and forward
@@ -228,7 +231,7 @@ figma.ui.onmessage = async (msg) => {
   // ============================================================================
   if (msg.type === 'BOOT_LOAD_UI' && msg.html) {
     console.log('🌉 [Desktop Bridge] Bootloader delivered fresh UI (' + msg.html.length + ' bytes), loading...');
-    figma.showUI(msg.html, { width: 140, height: 50, visible: true, themeColors: true });
+    figma.showUI(msg.html, { width: DEFAULT_UI_WIDTH, height: DEFAULT_UI_HEIGHT, visible: true, themeColors: true });
 
     // Re-send variables data to the fresh UI — the original send went to the
     // bootloader which discarded it. The fresh UI needs it to show "ready" status.
@@ -269,7 +272,7 @@ figma.ui.onmessage = async (msg) => {
   // ============================================================================
   if (msg.type === 'BOOT_FALLBACK') {
     console.log('🌉 [Desktop Bridge] Old server detected on port ' + msg.port + ', using cached UI');
-    figma.showUI(__html__, { width: 140, height: 50, visible: true, themeColors: true });
+    figma.showUI(__html__, { width: DEFAULT_UI_WIDTH, height: DEFAULT_UI_HEIGHT, visible: true, themeColors: true });
     return;
   }
 
@@ -3058,6 +3061,8 @@ figma.ui.onmessage = async (msg) => {
           currentPageId: figma.currentPage.id,
           selectionCount: selection ? selection.length : 0,
           pluginVersion: PLUGIN_VERSION,
+          pluginSessionId: PLUGIN_SESSION_ID,
+          uiVisible: true,
           editorType: __editorType
         }
       });
@@ -3076,7 +3081,7 @@ figma.ui.onmessage = async (msg) => {
   // RESIZE_UI - Dynamically resize the plugin window (e.g., Cloud Mode toggle)
   // ============================================================================
   else if (msg.type === 'RESIZE_UI') {
-    figma.ui.resize(msg.width || 120, msg.height || 36);
+    figma.ui.resize(msg.width || DEFAULT_UI_WIDTH, msg.height || DEFAULT_UI_HEIGHT);
   }
 
   // ============================================================================
@@ -3101,7 +3106,7 @@ figma.ui.onmessage = async (msg) => {
       });
       // Short delay to let the response message be sent before reload
       setTimeout(function() {
-        figma.showUI(__html__, { width: 140, height: 50, visible: true, themeColors: true });
+        figma.showUI(__html__, { width: DEFAULT_UI_WIDTH, height: DEFAULT_UI_HEIGHT, visible: true, themeColors: true });
       }, 100);
     } catch (error) {
       var errorMsg = error && error.message ? error.message : String(error);

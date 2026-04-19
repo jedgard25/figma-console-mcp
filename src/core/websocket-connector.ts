@@ -9,15 +9,15 @@
  */
 
 import type { IFigmaConnector } from './figma-connector.js';
-import type { FigmaWebSocketServer } from './websocket-server.js';
+import type { BridgeController } from './bridge-controller.js';
 import { createChildLogger } from './logger.js';
 
 const logger = createChildLogger({ component: 'websocket-connector' });
 
 export class WebSocketConnector implements IFigmaConnector {
-  private wsServer: FigmaWebSocketServer;
+  private wsServer: BridgeController;
 
-  constructor(wsServer: FigmaWebSocketServer) {
+  constructor(wsServer: BridgeController) {
     this.wsServer = wsServer;
   }
 

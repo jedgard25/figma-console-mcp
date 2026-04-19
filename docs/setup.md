@@ -208,6 +208,22 @@ The Desktop Bridge Plugin connects via WebSocket — no special Figma launch fla
 
 > **Alternative path:** If `~/.figma-console-mcp/plugin/` doesn't exist yet (first run), you can find the path by running `npx figma-console-mcp@latest --print-path` or checking the `pluginPath` field in `figma_get_status`.
 
+#### Install The macOS Bridge Daemon
+
+On macOS, install the persistent bridge once so the Figma plugin stays attached even when individual MCP chats start and stop:
+
+```bash
+npx figma-console-mcp@latest install-daemon
+```
+
+Useful follow-up commands:
+
+```bash
+npx figma-console-mcp@latest daemon-status
+npx figma-console-mcp@latest daemon-restart
+npx figma-console-mcp@latest daemon-uninstall
+```
+
 **📖 [Desktop Bridge Plugin Documentation](https://github.com/southleft/figma-console-mcp/tree/main/figma-desktop-bridge)**
 
 #### Multi-Instance / Port Conflicts

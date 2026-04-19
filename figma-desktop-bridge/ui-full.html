@@ -14,23 +14,32 @@
       font-size: 11px;
       background: var(--figma-color-bg, #2c2c2c);
       color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 6px 8px;
+      min-height: 100%;
+      padding: 8px;
       user-select: none;
+    }
+
+    .plugin-shell {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      width: 100%;
     }
 
     .bridge-status {
       display: flex;
-      align-items: center;
+      flex-direction: column;
       gap: 6px;
-      padding: 4px 8px;
+      padding: 8px;
       background: var(--figma-color-bg-secondary, #383838);
       border: 1px solid var(--figma-color-border, #4a4a4a);
-      border-radius: 4px;
-      white-space: nowrap;
+      border-radius: 6px;
+    }
+
+    .status-main {
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .status-indicator {
@@ -68,6 +77,8 @@
     .status-text {
       font-weight: 500;
       letter-spacing: 0.2px;
+      display: flex;
+      align-items: center;
     }
 
     .status-text .label {
@@ -77,6 +88,41 @@
     .status-text .state {
       color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
       margin-left: 4px;
+    }
+
+    .status-meta,
+    .status-file {
+      font-size: 10px;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.65));
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .status-actions {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+
+    .status-actions button {
+      appearance: none;
+      border: 1px solid var(--figma-color-border, #4a4a4a);
+      background: var(--figma-color-bg, #2c2c2c);
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+      border-radius: 4px;
+      font-size: 10px;
+      padding: 4px 6px;
+      cursor: pointer;
+    }
+
+    .status-actions button.primary {
+      background: var(--figma-color-bg-brand, #0d99ff);
+      border-color: var(--figma-color-bg-brand, #0d99ff);
+      color: #fff;
+    }
+
+    .status-actions button.hidden {
+      display: none;
     }
 
     /* Cloud Mode toggle */
@@ -191,12 +237,22 @@
   </style>
 </head>
 <body>
-  <div style="display: flex; flex-direction: column; align-items: center; width: 100%;">
+  <div class="plugin-shell">
     <div class="bridge-status" id="status-container">
-      <div class="status-indicator loading" id="status-dot"></div>
-      <div class="status-text">
-        <span class="label">MCP</span>
-        <span class="state" id="status-state">connecting</span>
+      <div class="status-main">
+        <div class="status-indicator loading" id="status-dot"></div>
+        <div class="status-text">
+          <span class="label">MCP</span>
+          <span class="state" id="status-state">connecting</span>
+        </div>
+      </div>
+      <div class="status-meta" id="status-meta">Looking for the preferred local bridge.</div>
+      <div class="status-file" id="status-file">File info unavailable.</div>
+      <div class="status-actions">
+        <button class="primary" onclick="pluginLocalReconnect()">Reconnect</button>
+        <button onclick="pluginLocalRescan()">Rescan</button>
+        <button onclick="pluginLocalReloadUi()">Reload UI</button>
+        <button id="takeover-btn" class="hidden" onclick="pluginLocalTakeover()">Take over</button>
       </div>
     </div>
 
@@ -235,6 +291,63 @@
       dot.className = 'status-indicator ' + (isError ? 'error' : (isActive ? 'active' : 'loading'));
       stateText.textContent = state;
     }
+
+    window.__localBridgeState = {
+      connectionState: 'connecting',
+      preferredPort: 9223,
+      serverPort: null,
+      serverPid: null,
+      serverVersion: null,
+      ownerLeaseId: null,
+      pluginVersion: null,
+      fileName: null,
+      lastSuccessfulHandshakeAt: null,
+      lastHeartbeatAt: null,
+      lastDisconnectReason: null,
+      takeoverAvailable: false,
+      ownershipStatus: null
+    };
+
+    function formatTimestampAgo(timestamp) {
+      if (!timestamp) return 'never';
+      var delta = Math.max(0, Date.now() - timestamp);
+      if (delta < 1500) return 'just now';
+      var seconds = Math.round(delta / 1000);
+      if (seconds < 60) return seconds + 's ago';
+      var minutes = Math.round(seconds / 60);
+      if (minutes < 60) return minutes + 'm ago';
+      var hours = Math.round(minutes / 60);
+      return hours + 'h ago';
+    }
+
+    function updateStatusPanel() {
+      var state = window.__localBridgeState;
+      var isError = state.connectionState === 'disconnected' || state.connectionState === 'stale';
+      var isActive = state.connectionState === 'connected';
+      updateStatus(String(state.connectionState || 'connecting').replace(/_/g, ' '), isActive, isError);
+
+      var meta = [];
+      meta.push('port ' + (state.serverPort || state.preferredPort));
+      if (state.serverPid) meta.push('pid ' + state.serverPid);
+      if (state.serverVersion) meta.push('server v' + state.serverVersion);
+      if (state.pluginVersion) meta.push('plugin v' + state.pluginVersion);
+      if (state.lastHeartbeatAt) meta.push('heartbeat ' + formatTimestampAgo(state.lastHeartbeatAt));
+      if (state.lastDisconnectReason && !isActive) meta.push('last: ' + state.lastDisconnectReason);
+      document.getElementById('status-meta').textContent = meta.join(' • ') || 'Waiting for bridge state';
+
+      document.getElementById('status-file').textContent = state.fileName
+        ? ('File: ' + state.fileName + ' • handshake ' + formatTimestampAgo(state.lastSuccessfulHandshakeAt))
+        : 'File info unavailable.';
+
+      var takeoverBtn = document.getElementById('takeover-btn');
+      if (state.takeoverAvailable || state.ownershipStatus === 'compatibility_fallback' || state.connectionState === 'taken_over') {
+        takeoverBtn.classList.remove('hidden');
+      } else {
+        takeoverBtn.classList.add('hidden');
+      }
+    }
+
+    setInterval(updateStatusPanel, 1000);
 
     // ============================================================================
     // COMMAND INFRASTRUCTURE - Generic plugin command sender
@@ -608,23 +721,18 @@
     // WEBSOCKET BRIDGE CLIENT - Fallback transport when CDP is unavailable
     // ============================================================================
     (function() {
-      // Port range for multi-instance support (matches server's port-discovery.ts)
       var WS_PORT_RANGE_START = 9223;
       var WS_PORT_RANGE_END = 9232;
+      var activeConnections = [];
+      var activeLocal = null;
+      var isConnectingLocal = false;
+      var retryTimer = null;
+      var retryDelayMs = 1000;
 
-      // Multi-connection state: plugin connects to ALL active MCP servers
-      // so that every Claude tab/CLI instance gets Figma access.
-      var activeConnections = []; // Array of { port, ws }
-      var wsReconnectDelay = 500;
-      var wsMaxReconnectDelay = 5000;
-      var wsReconnectAttempts = 0;
-      var wsMaxReconnectAttempts = 50;
-      var isScanning = false;
-
-      // Backward-compat: ws and wsConnected reflect "at least one connection"
       var ws = null;
       var wsPort = null;
       var wsConnected = false;
+      window.__localBridgeState.preferredPort = WS_PORT_RANGE_START;
 
       // Method-to-function mapping
       var methodMap = {
@@ -679,6 +787,18 @@
         'RELOAD_UI': function() {
           return window.sendPluginCommand('RELOAD_UI', {});
         },
+        'REQUEST_RECONNECT': function(params) {
+          return requestLocalConnect({ scanRange: !!(params && params.scanRange), manual: true, takeover: false });
+        },
+        'REQUEST_RESCAN': function() {
+          return requestLocalConnect({ scanRange: true, manual: true, takeover: false });
+        },
+        'REQUEST_UI_RELOAD': function() {
+          return window.sendPluginCommand('RELOAD_UI', {});
+        },
+        'REQUEST_TAKEOVER': function() {
+          return requestLocalConnect({ scanRange: true, manual: true, takeover: true });
+        },
         // Annotation tools — forward to plugin code.js
         'ANALYZE_COMPONENT_SET': function(params) {
           return window.analyzeComponentSet(params.nodeId);
@@ -697,29 +817,6 @@
         }
       };
 
-      /**
-       * Check if we already have a connection to a specific port.
-       */
-      function isPortConnected(port) {
-        for (var i = 0; i < activeConnections.length; i++) {
-          if (activeConnections[i].port === port && activeConnections[i].ws.readyState === 1) {
-            return true;
-          }
-        }
-        return false;
-      }
-
-      /**
-       * Remove a connection from the active list and update compat state.
-       */
-      function removeConnection(port) {
-        activeConnections = activeConnections.filter(function(c) { return c.port !== port; });
-        updateCompatState();
-      }
-
-      /**
-       * Update backward-compat variables (ws, wsPort, wsConnected).
-       */
       function updateCompatState() {
         var live = activeConnections.filter(function(c) { return c.ws.readyState === 1; });
         wsConnected = live.length > 0;
@@ -732,11 +829,48 @@
         }
       }
 
-      /**
-       * Initialize a new connection to a server: send FILE_INFO, variables, attach handlers.
-       */
+      function setLocalState(patch) {
+        for (var key in patch) {
+          if (patch.hasOwnProperty(key)) {
+            window.__localBridgeState[key] = patch[key];
+          }
+        }
+        updateStatusPanel();
+      }
+
+      function emitConnectionState(activeWs, connectionState, extra) {
+        if (!activeWs || activeWs.readyState !== 1) return;
+        try {
+          activeWs.send(JSON.stringify({
+            type: 'CONNECTION_STATE',
+            data: Object.assign({
+              connectionState: connectionState,
+              timestamp: Date.now()
+            }, extra || {})
+          }));
+        } catch (e) {
+          // best-effort
+        }
+      }
+
+      function removeConnection(port, kind) {
+        activeConnections = activeConnections.filter(function(c) {
+          return !(c.port === port && (!kind || c.kind === kind));
+        });
+        updateCompatState();
+      }
+
+      function closeActiveLocal(reason) {
+        if (activeLocal && activeLocal.ws) {
+          try { activeLocal.ws.close(1000, reason || 'Manual local reconnect'); } catch (e) { /* ignore */ }
+        }
+        if (activeLocal) {
+          removeConnection(activeLocal.port, 'local');
+          activeLocal = null;
+        }
+      }
+
       function initializeConnection(connWs, port) {
-        // Forward cached variables if available
         if (window.__figmaVariablesReady && window.__figmaVariablesData) {
           connWs.send(JSON.stringify({
             type: 'VARIABLES_DATA',
@@ -744,147 +878,44 @@
           }));
         }
 
-        // Proactively report file identity to this server
         window.sendPluginCommand('GET_FILE_INFO', {})
           .then(function(info) {
             if (connWs.readyState === 1 && info && info.success !== false) {
-              connWs.send(JSON.stringify({ type: 'FILE_INFO', data: info.fileInfo || info }));
+              var fileInfo = info.fileInfo || info;
+              connWs.send(JSON.stringify({ type: 'FILE_INFO', data: fileInfo }));
+              setLocalState({
+                fileName: fileInfo.fileName || null,
+                pluginVersion: fileInfo.pluginVersion || window.__localBridgeState.pluginVersion,
+                lastSuccessfulHandshakeAt: Date.now(),
+                lastHeartbeatAt: Date.now()
+              });
+              emitConnectionState(connWs, 'connected');
             }
           })
           .catch(function() { /* non-critical */ });
       }
 
-      /**
-       * Scan the port range and connect to ALL active MCP servers.
-       * Each server (e.g., Chat tab on 9223, Code tab on 9224) gets its own
-       * independent WebSocket connection so every Claude instance has Figma access.
-       * Falls back to retry with backoff if no servers found at all.
-       */
-      // Maximum scan attempts on initial load (prevents infinite error loops).
-      // After connecting, disconnect-triggered retries have their own limit.
-      var initialScanAttempts = 0;
-      var MAX_INITIAL_SCANS = 3;
-
-      function wsScanAndConnect() {
-        if (isScanning) return;
-        isScanning = true;
-
-        var portsToTry = [];
-        for (var p = WS_PORT_RANGE_START; p <= WS_PORT_RANGE_END; p++) {
-          if (!isPortConnected(p)) portsToTry.push(p);
-        }
-
-        if (portsToTry.length === 0) { isScanning = false; return; }
-
-        console.log('[MCP Bridge] Scanning ports ' + WS_PORT_RANGE_START + '-' + WS_PORT_RANGE_END + ' for MCP servers...');
-
-        var foundAny = false;
-        var pending = portsToTry.length;
-
-        portsToTry.forEach(function(port) {
-          try {
-            var testWs = new WebSocket('ws://localhost:' + port);
-
-            var timeout = setTimeout(function() {
-              if (testWs.readyState !== 1) testWs.close();
-            }, 3000);
-
-            testWs.onopen = function() {
-              clearTimeout(timeout);
-              foundAny = true;
-              activeConnections.push({ port: port, ws: testWs });
-              updateCompatState();
-              console.log('[MCP Bridge] WebSocket connected to port ' + port + ' (' + activeConnections.length + ' server(s) total)');
-              attachWsHandlers(testWs, port);
-              initializeConnection(testWs, port);
-              pending--;
-              if (pending <= 0) {
-                isScanning = false;
-                wsReconnectDelay = 500;
-                wsReconnectAttempts = 0;
-              }
-            };
-
-            testWs.onerror = function() {
-              clearTimeout(timeout);
-            };
-
-            testWs.onclose = function() {
-              clearTimeout(timeout);
-              pending--;
-              if (pending <= 0) {
-                isScanning = false;
-                // Retry with backoff if no servers found, up to MAX_INITIAL_SCANS
-                if (!foundAny && activeConnections.length === 0) {
-                  initialScanAttempts++;
-                  if (initialScanAttempts < MAX_INITIAL_SCANS) {
-                    var delay = 3000 * initialScanAttempts; // 3s, 6s
-                    console.log('[MCP Bridge] No servers found, retry ' + initialScanAttempts + '/' + MAX_INITIAL_SCANS + ' in ' + (delay/1000) + 's');
-                    setTimeout(wsScanAndConnect, delay);
-                  } else {
-                    console.log('[MCP Bridge] No MCP servers found after ' + MAX_INITIAL_SCANS + ' scans. Restart plugin to retry.');
-                  }
-                }
-              }
-            };
-          } catch (e) {
-            pending--;
-          }
-        });
-      }
-
-      /**
-       * Reconnect a specific port that disconnected.
-       * Tries the same port first (server may have just restarted),
-       * then does a full rescan to pick up any new servers.
-       */
-      // Long-interval reconnect timers — keyed by port to avoid duplicates
-      var longIntervalTimers = {};
-
-      function wsReconnectPort(port) {
-        try {
-          var testWs = new WebSocket('ws://localhost:' + port);
-          var timeout = setTimeout(function() {
-            if (testWs.readyState !== 1) testWs.close();
-          }, 2000);
-
-          testWs.onopen = function() {
-            clearTimeout(timeout);
-            activeConnections.push({ port: port, ws: testWs });
-            updateCompatState();
-            // Reset reconnect counter on ANY successful connect (fixes global counter bug)
-            wsReconnectAttempts = 0;
-            // Cancel long-interval retry for this port
-            if (longIntervalTimers[port]) {
-              clearInterval(longIntervalTimers[port]);
-              delete longIntervalTimers[port];
-            }
-            console.log('[MCP Bridge] Reconnected to port ' + port + ' (' + activeConnections.length + ' server(s) total)');
-            attachWsHandlers(testWs, port);
-            initializeConnection(testWs, port);
-          };
-
-          testWs.onerror = function() {
-            clearTimeout(timeout);
-          };
-        } catch (e) {
-          // Port gone — no further scanning to avoid console spam
-        }
-      }
-
-      /**
-       * Attach message/close/error handlers to an established WebSocket connection.
-       */
-      function attachWsHandlers(activeWs, port) {
+      function attachWsHandlers(activeWs, port, kind) {
+        kind = kind || 'local';
         activeWs.onmessage = function(event) {
           try {
             var message = JSON.parse(event.data);
 
-            // Handle server identity messages
             if (message.type === 'SERVER_HELLO' && message.data) {
               console.log('[MCP Bridge] Connected to server on port ' + message.data.port + ' (PID: ' + message.data.pid + ', v' + message.data.serverVersion + ')');
-              var conn = activeConnections.find(function(c) { return c.ws === activeWs; });
-              if (conn) conn.serverInfo = message.data;
+              setLocalState({
+                connectionState: message.data.ownershipStatus === 'compatibility_fallback' ? 'taken_over' : 'connected',
+                serverPort: message.data.port || port,
+                serverPid: message.data.pid || null,
+                serverVersion: message.data.serverVersion || null,
+                ownerLeaseId: message.data.ownerLeaseId || null,
+                preferredPort: message.data.preferredPort || WS_PORT_RANGE_START,
+                takeoverAvailable: !!message.data.takeoverAvailable,
+                ownershipStatus: message.data.ownershipStatus || null,
+                lastSuccessfulHandshakeAt: Date.now(),
+                lastHeartbeatAt: Date.now(),
+                lastDisconnectReason: null
+              });
               return;
             }
 
@@ -917,45 +948,157 @@
         };
 
         activeWs.onclose = function(event) {
-          removeConnection(port);
-          console.log('[MCP Bridge] WebSocket disconnected from port ' + port + ' (' + activeConnections.length + ' server(s) remaining)');
-
-          // If replaced by same file reconnecting (e.g., plugin reloaded), stop
-          var wasReplaced = (event.code === 1000 && (
-            event.reason === 'Replaced by new connection' ||
-            event.reason === 'Replaced by same file reconnection'
-          ));
-          if (wasReplaced) {
-            console.log('[MCP Bridge] WebSocket:' + port + ': replaced by newer connection, stopping reconnect');
-            return;
-          }
-
-          // Retry the specific port with limited attempts (no full rescan)
-          wsReconnectAttempts++;
-          if (wsReconnectAttempts <= 5) {
-            var delay = Math.min(1000 * wsReconnectAttempts, 5000);
-            setTimeout(function() { wsReconnectPort(port); }, delay);
-          } else if (!longIntervalTimers[port]) {
-            // After rapid retries exhausted, start a low-frequency background retry.
-            // One attempt every 30s — if the MCP server restarts, we'll find it
-            // without requiring the user to manually reopen the plugin.
-            console.log('[MCP Bridge] Rapid retries exhausted for port ' + port + '. Starting 30s background retry.');
-            longIntervalTimers[port] = setInterval(function() {
-              if (isPortConnected(port)) {
-                // Already reconnected (e.g., via another path) — stop retrying
-                clearInterval(longIntervalTimers[port]);
-                delete longIntervalTimers[port];
-                return;
-              }
-              wsReconnectPort(port);
-            }, 30000);
+          removeConnection(port, kind);
+          if (kind === 'local') {
+            if (activeLocal && activeLocal.ws === activeWs) {
+              activeLocal = null;
+            }
+            setLocalState({
+              connectionState: 'retrying',
+              serverPort: port,
+              lastDisconnectReason: event.reason || 'Connection closed'
+            });
+            schedulePreferredRetry();
           }
         };
 
         activeWs.onerror = function() {
-          // onclose will fire after this, triggering reconnect
+          if (kind === 'local') {
+            setLocalState({ connectionState: 'retrying' });
+          }
         };
       }
+
+      function connectToPort(port, done) {
+        try {
+          var testWs = new WebSocket('ws://localhost:' + port);
+          var finished = false;
+          var timeout = setTimeout(function() {
+            if (!finished && testWs.readyState !== 1) {
+              finished = true;
+              try { testWs.close(); } catch (e) { /* ignore */ }
+              done(false);
+            }
+          }, 2500);
+
+          testWs.onopen = function() {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timeout);
+            closeActiveLocal('Replacing local bridge connection');
+            activeLocal = { port: port, ws: testWs, kind: 'local' };
+            activeConnections.push(activeLocal);
+            updateCompatState();
+            retryDelayMs = 1000;
+            attachWsHandlers(testWs, port, 'local');
+            initializeConnection(testWs, port);
+            done(true);
+          };
+
+          testWs.onerror = function() {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timeout);
+            done(false);
+          };
+
+          testWs.onclose = function() {
+            if (!finished) {
+              finished = true;
+              clearTimeout(timeout);
+              done(false);
+            }
+          };
+        } catch (e) {
+          done(false);
+        }
+      }
+
+      function attemptPorts(ports, index, onDone) {
+        if (index >= ports.length) {
+          onDone(false);
+          return;
+        }
+        connectToPort(ports[index], function(success) {
+          if (success) onDone(true);
+          else attemptPorts(ports, index + 1, onDone);
+        });
+      }
+
+      function schedulePreferredRetry() {
+        if (retryTimer) clearTimeout(retryTimer);
+        setLocalState({ connectionState: 'retrying' });
+        retryTimer = setTimeout(function() {
+          requestLocalConnect({ scanRange: false, manual: false, takeover: false });
+        }, retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, 10000);
+      }
+
+      function requestLocalConnect(options) {
+        options = options || {};
+        if (isConnectingLocal) {
+          return Promise.resolve({ success: false, state: window.__localBridgeState.connectionState });
+        }
+
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          retryTimer = null;
+        }
+
+        var ports = options.scanRange
+          ? (function() {
+              var list = [];
+              for (var p = WS_PORT_RANGE_START; p <= WS_PORT_RANGE_END; p++) list.push(p);
+              return list;
+            })()
+          : [WS_PORT_RANGE_START];
+
+        isConnectingLocal = true;
+        setLocalState({
+          connectionState: options.takeover ? 'taken_over' : 'connecting',
+          lastDisconnectReason: options.takeover ? 'Preparing takeover' : null,
+          takeoverAvailable: !!options.takeover
+        });
+
+        return new Promise(function(resolve) {
+          attemptPorts(ports, 0, function(success) {
+            isConnectingLocal = false;
+            if (success) {
+              resolve({ success: true, port: window.__localBridgeState.serverPort || WS_PORT_RANGE_START });
+              return;
+            }
+
+            setLocalState({
+              connectionState: options.manual ? 'disconnected' : 'retrying',
+              serverPort: null,
+              serverPid: null,
+              lastDisconnectReason: options.scanRange
+                ? 'No local bridge found in compatibility scan'
+                : 'Preferred local bridge unavailable'
+            });
+
+            if (!options.manual) schedulePreferredRetry();
+            resolve({ success: false });
+          });
+        });
+      }
+
+      window.pluginLocalReconnect = function() {
+        return requestLocalConnect({ scanRange: false, manual: true, takeover: false });
+      };
+
+      window.pluginLocalRescan = function() {
+        return requestLocalConnect({ scanRange: true, manual: true, takeover: false });
+      };
+
+      window.pluginLocalReloadUi = function() {
+        return window.sendPluginCommand('RELOAD_UI', {});
+      };
+
+      window.pluginLocalTakeover = function() {
+        closeActiveLocal('Local takeover requested');
+        return requestLocalConnect({ scanRange: true, manual: true, takeover: true });
+      };
 
       /**
        * Broadcast a message to ALL active WebSocket connections.
@@ -1008,9 +1151,9 @@
 
       // Expose functions for Cloud Mode to add connections to the same pool
       window.__wsAddCloudConnection = function(cloudWs, label, onDisconnect) {
-        activeConnections.push({ port: label, ws: cloudWs });
+        activeConnections.push({ port: label, ws: cloudWs, kind: 'cloud' });
         updateCompatState();
-        attachWsHandlers(cloudWs, label);
+        attachWsHandlers(cloudWs, label, 'cloud');
         // Chain cloud disconnect callback after attachWsHandlers' onclose
         if (onDisconnect) {
           var origOnClose = cloudWs.onclose;
@@ -1027,7 +1170,7 @@
       // Single scan on load — no periodic rescanning to avoid console spam.
       // If no server found, retries up to MAX_INITIAL_SCANS times then stops.
       // On disconnect, retries the specific port up to 5 times then stops.
-      wsScanAndConnect();
+      requestLocalConnect({ scanRange: false, manual: false, takeover: false });
     })();
 
     // ============================================================================
@@ -1044,8 +1187,8 @@
       toggle.classList.toggle('expanded');
 
       // Resize plugin window to fit content
-      var height = isExpanding ? 130 : 50;
-      parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 140, height: height } }, '*');
+      var height = isExpanding ? 250 : 170;
+      parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 320, height: height } }, '*');
     }
 
     function resetCloudUI() {
@@ -1166,7 +1309,7 @@
         case 'VARIABLES_DATA':
           window.__figmaVariablesData = msg.data;
           window.__figmaVariablesReady = true;
-          updateStatus('ready', true, false);
+          setTimeout(updateStatusPanel, 0);
           console.log('[MCP Bridge] Active - ' + (msg.data.variables?.length || 0) + ' vars');
           // Forward to WebSocket client if connected
           if (window.__wsForwardVariables) window.__wsForwardVariables(msg.data);
@@ -1185,7 +1328,8 @@
 
         case 'ERROR':
           window.__figmaVariablesReady = false;
-          updateStatus('error', false, true);
+          window.__localBridgeState.lastDisconnectReason = msg.error;
+          updateStatusPanel();
           console.error('[MCP Bridge] Error:', msg.error);
           break;
 

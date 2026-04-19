@@ -191,6 +191,17 @@ Then follow [NPX Steps 3-5](#step-3-connect-to-figma-desktop) above.
 
 **📖 [Complete Setup Guide](docs/setup.md)**
 
+#### Bridge Daemon Commands
+
+Local mode now uses a persistent macOS bridge daemon so the Desktop Bridge plugin stays connected across short-lived MCP sessions.
+
+```bash
+figma-console-mcp install-daemon
+figma-console-mcp daemon-status
+figma-console-mcp daemon-restart
+figma-console-mcp daemon-uninstall
+```
+
 ---
 
 ### 📡 Remote SSE (Read-Only Exploration)

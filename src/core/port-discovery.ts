@@ -29,6 +29,7 @@ import { writeFileSync, readFileSync, unlinkSync, existsSync, readdirSync } from
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createChildLogger } from './logger.js';
+import { execSync } from 'child_process';
 
 const logger = createChildLogger({ component: 'port-discovery' });
 
@@ -63,6 +64,15 @@ export interface PortFileData {
   startedAt: string;
   /** Updated by heartbeat every 30s. Missing in port files from pre-v1.12 instances. */
   lastSeen?: string;
+  serverVersion?: string;
+  leaseId?: string;
+  preferredPort?: number;
+}
+
+export interface PortProcessInfo {
+  port: number;
+  pid: number;
+  command?: string;
 }
 
 /**
@@ -93,7 +103,11 @@ export function getPortFilePath(port: number): string {
  * Write a port advertisement file so clients can discover this server instance.
  * Includes PID for stale-file detection and lastSeen for heartbeat tracking.
  */
-export function advertisePort(port: number, host: string = 'localhost'): void {
+export function advertisePort(
+  port: number,
+  host: string = 'localhost',
+  metadata?: Pick<PortFileData, 'serverVersion' | 'leaseId' | 'preferredPort'>,
+): void {
   const now = new Date().toISOString();
   const data: PortFileData = {
     port,
@@ -101,6 +115,9 @@ export function advertisePort(port: number, host: string = 'localhost'): void {
     host,
     startedAt: now,
     lastSeen: now,
+    serverVersion: metadata?.serverVersion,
+    leaseId: metadata?.leaseId,
+    preferredPort: metadata?.preferredPort,
   };
 
   const filePath = getPortFilePath(port);
@@ -199,6 +216,77 @@ function terminateProcess(pid: number): boolean {
   }
 }
 
+function getListeningPids(port: number): number[] {
+  if (process.platform === 'win32') return [];
+
+  try {
+    const output = execSync(`lsof -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`, {
+      encoding: 'utf-8',
+      timeout: 3000,
+    }).trim();
+
+    if (!output) return [];
+    return output.split('\n').map(Number).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+export function getListeningProcessInfo(port: number): PortProcessInfo[] {
+  const pids = getListeningPids(port);
+  const infos: PortProcessInfo[] = [];
+
+  for (const pid of pids) {
+    let command: string | undefined;
+    try {
+      command = execSync(`ps -p ${pid} -o command= 2>/dev/null`, {
+        encoding: 'utf-8',
+        timeout: 2000,
+      }).trim() || undefined;
+    } catch {
+      command = undefined;
+    }
+
+    infos.push({ port, pid, command });
+  }
+
+  return infos;
+}
+
+export function terminatePortListeners(
+  port: number,
+  options?: { excludePid?: number; requireCommandMatch?: boolean },
+): PortProcessInfo[] {
+  const infos = getListeningProcessInfo(port);
+  const terminated: PortProcessInfo[] = [];
+
+  for (const info of infos) {
+    if (options?.excludePid && info.pid === options.excludePid) continue;
+    if (options?.requireCommandMatch) {
+      const command = info.command || '';
+      const looksLikeMcp =
+        command.includes('figma-console-mcp') ||
+        command.includes('figma_console_mcp') ||
+        command.includes('dist/local.js') ||
+        command.includes('/local.js') ||
+        command.includes('tsx src/local.ts');
+      if (!looksLikeMcp) continue;
+    }
+
+    if (terminateProcess(info.pid)) {
+      terminated.push(info);
+    }
+  }
+
+  if (terminated.length > 0) {
+    try {
+      execSync('sleep 0.5', { timeout: 2000 });
+    } catch { /* non-critical */ }
+  }
+
+  return terminated;
+}
+
 /**
  * Read and validate a port advertisement file.
  * Returns null if the file doesn't exist, is invalid, or the owning process is dead.
@@ -240,6 +328,14 @@ export function discoverActiveInstances(preferredPort: number = DEFAULT_WS_PORT)
   }
 
   return instances;
+}
+
+/**
+ * Return the advertised MCP owner on the preferred port, if any.
+ * This is the single-owner source of truth for local mode.
+ */
+export function getAdvertisedOwner(preferredPort: number = DEFAULT_WS_PORT): PortFileData | null {
+  return readPortFile(preferredPort);
 }
 
 /**
@@ -320,15 +416,7 @@ export function cleanupOrphanedProcesses(preferredPort: number = DEFAULT_WS_PORT
   for (const port of ports) {
     try {
       // Find PIDs listening on this port via lsof
-      const { execSync } = require('child_process');
-      const output = execSync(`lsof -i :${port} -sTCP:LISTEN -t 2>/dev/null`, {
-        encoding: 'utf-8',
-        timeout: 3000,
-      }).trim();
-
-      if (!output) continue;
-
-      const pids = output.split('\n').map(Number).filter(Boolean);
+      const pids = getListeningPids(port);
 
       for (const pid of pids) {
         if (knownPids.has(pid)) continue; // Skip known-good servers
@@ -461,6 +549,43 @@ export function evictOldestInstance(preferredPort: number = DEFAULT_WS_PORT): bo
   } catch { /* non-critical */ }
 
   return true;
+}
+
+/**
+ * Forcefully terminate the process advertising a given port and remove its
+ * advertisement file. Used for explicit ownership takeover.
+ */
+export function terminateAdvertisedOwner(port: number = DEFAULT_WS_PORT): PortFileData | null {
+  const filePath = getPortFilePath(port);
+  const data = readPortFile(port);
+
+  if (!data || data.pid === process.pid) return null;
+
+  logger.info(
+    { port: data.port, pid: data.pid, leaseId: data.leaseId, serverVersion: data.serverVersion },
+    'Terminating advertised MCP owner for explicit takeover',
+  );
+
+  terminateProcess(data.pid);
+  try { unlinkSync(filePath); } catch { /* best-effort */ }
+
+  try {
+    const { execSync } = require('child_process');
+    execSync('sleep 0.5', { timeout: 2000 });
+  } catch { /* non-critical */ }
+
+  return data;
+}
+
+export function cleanupLegacyPortFile(port: number): boolean {
+  const filePath = getPortFilePath(port);
+  if (!existsSync(filePath)) return false;
+  try {
+    unlinkSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

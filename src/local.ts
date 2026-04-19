@@ -19,8 +19,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
-import { realpathSync, existsSync, readFileSync, mkdirSync, copyFileSync, writeFileSync } from "fs";
+import { realpathSync, existsSync, readFileSync, mkdirSync, copyFileSync, writeFileSync, rmSync } from "fs";
 import { homedir } from "os";
+import { request as httpRequest } from "http";
+import { execFileSync } from "child_process";
 import { LocalBrowserManager } from "./browser/local.js";
 import { ConsoleMonitor } from "./core/console-monitor.js";
 import { getConfig } from "./core/config.js";
@@ -40,21 +42,23 @@ import { registerDesignSystemTools } from "./core/design-system-tools.js";
 import { registerAccessibilityTools } from "./core/accessibility-tools.js";
 import { FigmaDesktopConnector } from "./core/figma-desktop-connector.js";
 import type { IFigmaConnector } from "./core/figma-connector.js";
-import { FigmaWebSocketServer } from "./core/websocket-server.js";
+import type { BridgeController } from "./core/bridge-controller.js";
+import { DaemonBridgeClient } from "./core/daemon-bridge-client.js";
+import { SERVER_VERSION } from "./core/websocket-server.js";
 import { WebSocketConnector } from "./core/websocket-connector.js";
 import {
 	DEFAULT_WS_PORT,
-	getPortRange,
-	advertisePort,
-	unadvertisePort,
-	registerPortCleanup,
 	discoverActiveInstances,
-	cleanupStalePortFiles,
-	cleanupOrphanedProcesses,
-	evictOldestInstance,
-	refreshPortAdvertisement,
-	HEARTBEAT_INTERVAL_MS,
+	type PortFileData,
 } from "./core/port-discovery.js";
+import {
+	DAEMON_LABEL,
+	getDaemonLogDir,
+	getDaemonSocketPath,
+	getDaemonStderrPath,
+	getDaemonStdoutPath,
+	getLaunchAgentPath,
+} from "./core/daemon-paths.js";
 import { registerTokenBrowserApp } from "./apps/token-browser/server.js";
 import { registerDesignSystemDashboardApp } from "./apps/design-system-dashboard/server.js";
 import { registerFigJamTools } from "./core/figjam-tools.js";
@@ -109,15 +113,103 @@ class LocalFigmaConsoleMCP {
 	private consoleMonitor: ConsoleMonitor | null = null;
 	private figmaAPI: FigmaAPI | null = null;
 	private desktopConnector: IFigmaConnector | null = null;
-	private wsServer: FigmaWebSocketServer | null = null;
-	private wsStartupError: { code: string; port: number } | null = null;
-	/** The port the WebSocket server actually bound to (may differ from preferred if fallback occurred) */
+	private wsServer: BridgeController | null = null;
+	private wsStartupError: { code: string; port: number; owner?: PortFileData | null } | null = null;
 	private wsActualPort: number | null = null;
-	/** The preferred port requested (from env var or default) */
 	private wsPreferredPort: number = DEFAULT_WS_PORT;
-	/** Heartbeat timer that refreshes port file to prove this server is active */
-	private wsHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private config = getConfig();
+
+	private async waitForWebSocketClient(timeoutMs = 5000): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (this.wsServer instanceof DaemonBridgeClient) {
+				await this.wsServer.refreshStatus(true);
+			}
+			if (this.wsServer?.isClientConnected()) return true;
+			await new Promise((resolve) => setTimeout(resolve, 200));
+		}
+		if (this.wsServer instanceof DaemonBridgeClient) {
+			await this.wsServer.refreshStatus(true);
+		}
+		return this.wsServer?.isClientConnected() ?? false;
+	}
+
+	private async probeLocalOwnerHealth(port: number): Promise<{ status: string; version?: string; clients?: number } | null> {
+		return new Promise((resolve) => {
+			const req = httpRequest(
+				{
+					host: "127.0.0.1",
+					port,
+					path: "/health",
+					method: "GET",
+					timeout: 1200,
+				},
+				(res) => {
+					let body = "";
+					res.setEncoding("utf8");
+					res.on("data", (chunk) => {
+						body += chunk;
+					});
+					res.on("end", () => {
+						try {
+							const parsed = JSON.parse(body);
+							resolve(parsed);
+						} catch {
+							resolve(null);
+						}
+					});
+				},
+			);
+			req.on("error", () => resolve(null));
+			req.on("timeout", () => {
+				req.destroy();
+				resolve(null);
+			});
+			req.end();
+		});
+	}
+
+	private async refreshBridgeStatus(force = false): Promise<void> {
+		if (this.wsServer instanceof DaemonBridgeClient) {
+			await this.wsServer.refreshStatus(force);
+			const addr = this.wsServer.address();
+			this.wsActualPort = addr?.port ?? this.wsPreferredPort;
+		}
+	}
+
+	private async inspectPreferredPortOwner(): Promise<{
+		pid: number;
+		leaseId?: string;
+		serverVersion?: string;
+		source: "advertised" | "orphaned" | "unknown";
+		healthy: boolean;
+		command?: string;
+	} | null> {
+		if (this.wsServer instanceof DaemonBridgeClient) {
+			const status = await this.wsServer.refreshStatus(true);
+			const snapshot = status?.connectionSnapshot;
+			if (snapshot) {
+				return {
+					pid: snapshot.ownerPid,
+					leaseId: snapshot.ownerLeaseId,
+					serverVersion: snapshot.serverVersion,
+					source: "advertised",
+					healthy: true,
+				};
+			}
+		}
+
+		const health = await this.probeLocalOwnerHealth(this.wsPreferredPort);
+		if (health?.status === "ok") {
+			return {
+				pid: process.pid,
+				source: "advertised",
+				healthy: true,
+				serverVersion: health.version,
+			};
+		}
+		return null;
+	}
 
 	// In-memory cache for variables data to avoid MCP token limits
 	// Maps fileKey -> {data, timestamp}
@@ -139,6 +231,62 @@ class LocalFigmaConsoleMCP {
 			this.variablesCache.clear();
 			logger.info('Variables cache invalidated after write operation');
 		}
+	}
+
+	private getPreferredOwner(): PortFileData | null {
+		return null;
+	}
+
+	private async startPreferredWebSocketServer(): Promise<boolean> {
+		if (!this.wsServer) {
+			this.wsServer = new DaemonBridgeClient();
+		}
+		const status = this.wsServer instanceof DaemonBridgeClient
+			? await this.wsServer.refreshStatus(true)
+			: null;
+		this.wsActualPort = status?.address?.port ?? this.wsPreferredPort;
+		this.wsStartupError = status ? null : {
+			code: "DAEMON_UNAVAILABLE",
+			port: this.wsPreferredPort,
+		};
+		return !!status;
+	}
+
+	private async takeoverPreferredOwner(): Promise<PortFileData | null> {
+		await this.startPreferredWebSocketServer();
+		return null;
+	}
+
+	private async ensurePreferredBridgeOwnership(
+		reason: "startup" | "tool" | "reconnect" = "tool",
+	): Promise<"started" | "taken_over" | "blocked"> {
+		if (this.wsServer?.isStarted()) return "started";
+
+		const started = await this.startPreferredWebSocketServer();
+		if (started) return "started";
+
+		const owner = await this.inspectPreferredPortOwner();
+		if (!owner || owner.pid === process.pid || owner.source === "unknown") {
+			return "blocked";
+		}
+
+		logger.info(
+			{
+				reason,
+				preferredPort: this.wsPreferredPort,
+				ownerPid: owner.pid,
+				ownerLeaseId: owner.leaseId,
+				ownerSource: owner.source,
+			},
+			"Auto-taking over the preferred WebSocket bridge for the newest MCP session",
+		);
+
+		await this.takeoverPreferredOwner();
+		return this.wsServer?.isStarted() ? "taken_over" : "blocked";
+	}
+
+	private attachWebSocketServerListeners(): void {
+		// The long-lived daemon owns the live WebSocket bridge state.
 	}
 
 	constructor() {
@@ -242,6 +390,14 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 	 * Returns the active WebSocket Desktop Bridge connector.
 	 */
 	private async getDesktopConnector(): Promise<IFigmaConnector> {
+		await this.refreshBridgeStatus(true);
+		if (!this.wsServer?.isStarted() || !this.wsServer.isClientConnected()) {
+			const ownership = await this.ensurePreferredBridgeOwnership("tool");
+			if (ownership === "taken_over") {
+				await this.waitForWebSocketClient(4000);
+			}
+		}
+
 		// Try WebSocket first — instant check, no network timeout delay
 		if (this.wsServer?.isClientConnected()) {
 			try {
@@ -398,6 +554,8 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 		if (!this.config.local) {
 			throw new Error("Local mode configuration missing");
 		}
+
+		await this.refreshBridgeStatus(true);
 
 		// Check WebSocket availability
 		const wsAvailable = this.wsServer?.isClientConnected() ?? false;
@@ -638,6 +796,7 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			},
 			async ({ count, level, since }) => {
 				try {
+					await this.refreshBridgeStatus(true);
 					// Try console monitor first, fall back to WebSocket console buffer
 					let logs: import("./core/types/index.js").ConsoleLogEntry[];
 					let status: ReturnType<import("./core/console-monitor.js").ConsoleMonitor["getStatus"]> | ReturnType<NonNullable<typeof this.wsServer>["getConsoleStatus"]>;
@@ -649,7 +808,9 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						status = this.consoleMonitor.getStatus();
 					} else if (this.wsServer?.isClientConnected()) {
 						// WebSocket fallback — plugin-captured console logs
-						logs = this.wsServer.getConsoleLogs({ count, level, since });
+						logs = this.wsServer instanceof DaemonBridgeClient
+							? await this.wsServer.getRemoteConsoleLogs({ count, level, since })
+							: this.wsServer.getConsoleLogs({ count, level, since });
 						status = this.wsServer.getConsoleStatus();
 						source = "websocket";
 					} else {
@@ -992,7 +1153,9 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						// WebSocket fallback: reload the plugin UI iframe
 						transport = "websocket";
 						if (clearConsoleBefore && this.wsServer) {
-							clearedCount = this.wsServer.clearConsoleLogs();
+							clearedCount = this.wsServer instanceof DaemonBridgeClient
+								? await this.wsServer.clearRemoteConsoleLogs()
+								: this.wsServer.clearConsoleLogs();
 						}
 						await this.wsServer.sendCommand("RELOAD_UI", {}, 10000);
 						// Wait for the UI to reload and WebSocket to reconnect
@@ -1073,7 +1236,9 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 
 					// Try WebSocket buffer first (non-disruptive)
 					if (this.wsServer?.isClientConnected()) {
-						clearedCount = this.wsServer.clearConsoleLogs();
+						clearedCount = this.wsServer instanceof DaemonBridgeClient
+							? await this.wsServer.clearRemoteConsoleLogs()
+							: this.wsServer.clearConsoleLogs();
 						transport = "websocket";
 					} else {
 						// Try browser manager (initialize if needed)
@@ -1347,8 +1512,12 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			},
 			async ({ probe }) => {
 				try {
+					await this.refreshBridgeStatus(true);
 					// Check WebSocket availability
 					const wsConnected = this.wsServer?.isClientConnected() ?? false;
+					const preferredOwner = await this.inspectPreferredPortOwner();
+					const ownerConflict = !!(preferredOwner && preferredOwner.pid !== process.pid);
+					const connectionSnapshot = this.wsServer?.getConnectionSnapshot() ?? null;
 
 					let monitorStatus = this.consoleMonitor?.getStatus() ?? null;
 					let currentUrl = this.getCurrentFileUrl();
@@ -1398,18 +1567,32 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 					let probeResult: { success: boolean; latencyMs: number; error?: string } | undefined;
 					if (probe) {
 						const probeStart = Date.now();
-						try {
-							const result = await this.wsServer!.sendCommand('GET_FILE_INFO', {}, 3000);
-							probeResult = {
-								success: !!(result && result.fileInfo),
-								latencyMs: Date.now() - probeStart,
-							};
-						} catch (probeError: any) {
+						if (!this.wsServer?.isStarted()) {
 							probeResult = {
 								success: false,
 								latencyMs: Date.now() - probeStart,
-								error: probeError?.message || String(probeError),
+								error: "No local WebSocket bridge is running in this MCP session",
 							};
+						} else if (!wsConnected) {
+							probeResult = {
+								success: false,
+								latencyMs: Date.now() - probeStart,
+								error: "Desktop Bridge plugin is not connected to this MCP session",
+							};
+						} else {
+							try {
+								const result = await this.wsServer.sendCommand('GET_FILE_INFO', {}, 3000);
+								probeResult = {
+									success: !!(result && result.fileInfo),
+									latencyMs: Date.now() - probeStart,
+								};
+							} catch (probeError: any) {
+								probeResult = {
+									success: false,
+									latencyMs: Date.now() - probeStart,
+									error: probeError?.message || String(probeError),
+								};
+							}
 						}
 					}
 
@@ -1418,8 +1601,12 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						? undefined
 						: failureLayer === 1
 							? [
-								"Ensure your AI client (Claude Code, Cursor, etc.) is running with figma-console-mcp configured",
-								"Check if all ports 9223-9232 are occupied: lsof -i :9223-9232 | grep LISTEN",
+								ownerConflict
+									? "Another local MCP session currently owns the preferred bridge endpoint."
+									: "Ensure your AI client (Claude Code, Cursor, etc.) is running with figma-console-mcp configured",
+								ownerConflict
+									? "Call figma_reconnect to take over the preferred local connection."
+									: `Check whether port ${this.wsPreferredPort} is occupied: lsof -i :${this.wsPreferredPort} | grep LISTEN`,
 								"Kill stale processes if needed: pkill -f figma-console-mcp",
 								"Restart your AI client — the MCP server will start automatically on the next tool call",
 							]
@@ -1453,10 +1640,20 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 												port: this.wsActualPort ? String(this.wsActualPort) : null,
 												preferredPort: String(this.wsPreferredPort),
 												portFallbackUsed: this.wsActualPort !== null && this.wsActualPort !== this.wsPreferredPort,
+												ownerPid: connectionSnapshot?.ownerPid ?? preferredOwner?.pid ?? null,
+												ownerLeaseId: connectionSnapshot?.ownerLeaseId ?? preferredOwner?.leaseId ?? null,
+												pluginVersion: connectionSnapshot?.pluginVersion ?? wsFileInfo?.pluginVersion ?? null,
+												serverVersion: connectionSnapshot?.serverVersion ?? preferredOwner?.serverVersion ?? SERVER_VERSION,
+												connectionState: connectionSnapshot?.connectionState ?? (wsConnected ? "connected" : ownerConflict ? "taken_over" : "disconnected"),
+												lastHeartbeatAt: connectionSnapshot?.lastHeartbeatAt ? new Date(connectionSnapshot.lastHeartbeatAt).toISOString() : undefined,
+												lastDisconnectReason: this.wsServer?.getLastDisconnectReason() ?? undefined,
+												takeoverAvailable: ownerConflict,
 												startupError: this.wsStartupError ? {
 													code: this.wsStartupError.code,
 													port: this.wsStartupError.port,
-													message: `All ports in range ${this.wsPreferredPort}-${this.wsPreferredPort + 9} are in use`,
+													message: this.wsStartupError.code === "OWNER_ACTIVE"
+														? `Preferred port ${this.wsPreferredPort} is owned by another MCP session`
+														: `WebSocket startup failed on port ${this.wsPreferredPort}`,
 												} : undefined,
 												otherInstances: (() => {
 													try {
@@ -1506,34 +1703,38 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 											probeResult,
 											recoverySteps,
 											message: activeTransport === "websocket"
-												? this.wsActualPort !== this.wsPreferredPort
-													? `✅ Connected to Figma Desktop via WebSocket Bridge (port ${this.wsActualPort}, fallback from ${this.wsPreferredPort})`
-													: "✅ Connected to Figma Desktop via WebSocket Bridge"
-												: this.wsStartupError?.code === "EADDRINUSE"
-													? `❌ All WebSocket ports ${this.wsPreferredPort}-${this.wsPreferredPort + 9} are in use`
-													: this.wsActualPort !== null && this.wsActualPort !== this.wsPreferredPort
-													? `❌ WebSocket server running on port ${this.wsActualPort} (fallback) but no plugin connected. Restart the Desktop Bridge plugin in Figma to reconnect.`
+												? "✅ Connected to Figma Desktop via the preferred WebSocket Bridge"
+												: ownerConflict
+													? `⚠️ Another MCP session owns preferred port ${this.wsPreferredPort}`
 													: "❌ No connection to Figma Desktop",
 											setupInstructions: !setupValid
-												? this.wsStartupError?.code === "EADDRINUSE"
+												? ownerConflict
 													? {
-														cause: `All ports in range ${this.wsPreferredPort}-${this.wsPreferredPort + 9} are in use by other MCP server instances.`,
-														fix: "Close some of the other Claude Desktop tabs or terminal sessions running the MCP server, then restart this one.",
+														cause: `Preferred port ${this.wsPreferredPort} is owned by another MCP listener (PID ${preferredOwner?.pid ?? "unknown"}${preferredOwner?.source === "orphaned" ? ", orphaned from an older session" : ""}).`,
+														fix: preferredOwner?.source === "orphaned"
+															? "Call figma_reconnect to reclaim the preferred bridge from the orphaned MCP process."
+															: "Call figma_reconnect to take ownership and have the plugin reconnect to this session.",
 													}
 													: {
 														instructions: `Open the Desktop Bridge plugin in Figma (Plugins → Development → Figma Desktop Bridge). No special launch flags needed.${this.getPluginPath() ? ' Plugin manifest: ' + this.getPluginPath() : ''}`,
 													}
 												: undefined,
 											ai_instruction: !setupValid
-												? this.wsStartupError?.code === "EADDRINUSE"
-													? `All WebSocket ports in range ${this.wsPreferredPort}-${this.wsPreferredPort + 9} are in use — most likely multiple Claude Desktop tabs or terminal sessions are running the Figma Console MCP server. Ask the user to close some sessions and restart.`
-													: this.wsActualPort !== null && this.wsActualPort !== this.wsPreferredPort
-														? `Server is running on fallback port ${this.wsActualPort} (port ${this.wsPreferredPort} was taken by another instance). The Desktop Bridge plugin is not connected. TELL THE USER: Close and reopen the Desktop Bridge plugin in Figma to reconnect. The plugin's bootloader will automatically scan all ports in the range.`
-														: `No connection to Figma Desktop. Open the Desktop Bridge plugin in Figma to connect.${this.getPluginPath() ? ' Plugin manifest: ' + this.getPluginPath() : ''}`
+												? ownerConflict
+													? `Another local MCP listener owns preferred port ${this.wsPreferredPort}. Call figma_reconnect to reclaim ownership and force the plugin to reconnect here.`
+													: `No connection to Figma Desktop. Open the Desktop Bridge plugin in Figma to connect.${this.getPluginPath() ? ' Plugin manifest: ' + this.getPluginPath() : ''}`
 												: activeTransport === "websocket"
-													? `Connected via WebSocket Bridge to "${currentFileName || "unknown file"}" on port ${this.wsActualPort}. All design tools and console monitoring tools are available. Console logs are captured from the plugin sandbox (code.js). IMPORTANT: Always verify the file name before destructive operations when multiple files have the plugin open.`
+													? `Connected via WebSocket Bridge to "${currentFileName || "unknown file"}" on preferred port ${this.wsActualPort}. All design tools and console monitoring tools are available.`
 													: "All tools are ready to use.",
 										},
+										ownerPid: connectionSnapshot?.ownerPid ?? preferredOwner?.pid ?? null,
+										ownerLeaseId: connectionSnapshot?.ownerLeaseId ?? preferredOwner?.leaseId ?? null,
+										pluginVersion: connectionSnapshot?.pluginVersion ?? wsFileInfo?.pluginVersion ?? undefined,
+										serverVersion: connectionSnapshot?.serverVersion ?? preferredOwner?.serverVersion ?? SERVER_VERSION,
+										connectionState: connectionSnapshot?.connectionState ?? (wsConnected ? "connected" : ownerConflict ? "taken_over" : "disconnected"),
+										lastHeartbeatAt: connectionSnapshot?.lastHeartbeatAt ? new Date(connectionSnapshot.lastHeartbeatAt).toISOString() : undefined,
+										lastDisconnectReason: this.wsServer?.getLastDisconnectReason() ?? undefined,
+										takeoverAvailable: ownerConflict,
 										pluginPath: this.getPluginPath() || undefined,
 										consoleMonitor: monitorStatus,
 										initialized: setupValid,
@@ -1574,45 +1775,82 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			{},
 			async () => {
 				try {
+					await this.refreshBridgeStatus(true);
 					// Clear cached desktop connector to force fresh detection
 					this.desktopConnector = null;
 
 					let transport: string = "none";
 					let currentUrl: string | null = null;
 					let fileName: string | null = null;
+					let recoveryAction = "none";
+					let takeoverPerformed = false;
 
-					// Try browser manager reconnection if it exists
-					if (this.browserManager) {
+					if (!this.wsServer?.isStarted()) {
+						await this.startPreferredWebSocketServer();
+						recoveryAction = "start_preferred_owner";
+					}
+
+					if (!this.wsServer?.isClientConnected()) {
+						const owner = await this.inspectPreferredPortOwner();
+						if (owner && owner.pid !== process.pid) {
+							await this.takeoverPreferredOwner();
+							takeoverPerformed = true;
+							recoveryAction = owner.source === "orphaned" ? "reclaim_orphaned_owner" : "takeover_preferred_owner";
+						}
+					}
+
+					if (this.wsServer?.isClientConnected()) {
+						try {
+							await this.wsServer.sendCommand("GET_FILE_INFO", {}, 3000);
+							transport = "websocket";
+							recoveryAction = recoveryAction === "none" ? "probe_existing_connection" : recoveryAction;
+						} catch {
+							try {
+								await this.wsServer.requestClientReconnect(false);
+								recoveryAction = "request_plugin_reconnect";
+								await this.wsServer.sendCommand("GET_FILE_INFO", {}, 5000);
+								transport = "websocket";
+							} catch {
+								await this.wsServer.requestClientReloadUi();
+								recoveryAction = "request_ui_reload";
+							}
+						}
+					}
+
+					if (transport === "none" && this.wsServer?.isClientConnected()) {
+						try {
+							await this.wsServer.sendCommand("GET_FILE_INFO", {}, 5000);
+							transport = "websocket";
+						} catch {
+							// Keep falling through to plugin guidance below
+						}
+					}
+
+					if (transport === "none" && this.browserManager) {
 						try {
 							await this.browserManager.forceReconnect();
-
-							// Reinitialize console monitor with new page
 							if (this.consoleMonitor) {
 								this.consoleMonitor.stopMonitoring();
 								const page = await this.browserManager.getPage();
 								await this.consoleMonitor.startMonitoring(page);
 							}
-
 							currentUrl = this.getCurrentFileUrl();
 							transport = "websocket";
+							recoveryAction = recoveryAction === "none" ? "browser_reconnect" : recoveryAction;
 						} catch (reconnectError) {
 							logger.debug({ error: reconnectError }, "Browser reconnection failed, checking WebSocket");
 						}
 					}
 
-					// If browser reconnect didn't work, check WebSocket
-					if (transport === "none" && this.wsServer?.isClientConnected()) {
-						transport = "websocket";
-					}
+					const currentOwner = await this.inspectPreferredPortOwner();
 
 					if (transport === "none") {
 						throw new Error(
 							"Cannot connect to Figma Desktop.\n\n" +
-							"Open the Desktop Bridge plugin in Figma (Plugins → Development → Figma Desktop Bridge)."
+							"Open the Desktop Bridge plugin in Figma (Plugins → Development → Figma Desktop Bridge). The plugin now retries automatically, so you should not need to rerun it unless it is fully closed."
 						);
 					}
 
-					// Try to get the file name via whichever transport connected
 					try {
 						const connector = await this.getDesktopConnector();
 						const fileInfo = await connector.executeCodeViaUI(
@@ -1634,6 +1872,18 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 									{
 										status: "reconnected",
 										transport,
+										recoveryAction,
+										takeoverPerformed,
+										ownerPid: this.wsServer?.getConnectionSnapshot()?.ownerPid ?? currentOwner?.pid ?? null,
+										ownerLeaseId: this.wsServer?.getConnectionSnapshot()?.ownerLeaseId ?? currentOwner?.leaseId ?? null,
+										pluginVersion: this.wsServer?.getActiveClientPluginVersion() ?? undefined,
+										serverVersion: SERVER_VERSION,
+										connectionState: this.wsServer?.getActiveClientConnectionState() ?? (transport === "websocket" ? "connected" : "disconnected"),
+										lastHeartbeatAt: this.wsServer?.getConnectionSnapshot()?.lastHeartbeatAt
+											? new Date(this.wsServer.getConnectionSnapshot()!.lastHeartbeatAt!).toISOString()
+											: undefined,
+										lastDisconnectReason: this.wsServer?.getLastDisconnectReason() ?? undefined,
+										takeoverAvailable: !!(currentOwner && currentOwner.pid !== process.pid),
 										currentUrl,
 										fileName:
 											fileName ||
@@ -1687,6 +1937,7 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			},
 			async ({ verbose }) => {
 				try {
+					await this.refreshBridgeStatus(true);
 					const selection = this.wsServer?.getCurrentSelection() ?? null;
 
 					if (!this.wsServer?.isClientConnected()) {
@@ -1800,6 +2051,7 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			},
 			async ({ since, count, clear }) => {
 				try {
+					await this.refreshBridgeStatus(true);
 					if (!this.wsServer?.isClientConnected()) {
 						return {
 							content: [{
@@ -1813,7 +2065,9 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						};
 					}
 
-					const changes = this.wsServer.getDocumentChanges({ since, count });
+					const changes = this.wsServer instanceof DaemonBridgeClient
+						? await this.wsServer.getRemoteDocumentChanges({ since, count })
+						: this.wsServer.getDocumentChanges({ since, count });
 
 					// Compute summary
 					let totalNodeChanges = 0;
@@ -1828,7 +2082,11 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 					}
 
 					if (clear) {
-						this.wsServer.clearDocumentChanges();
+						if (this.wsServer instanceof DaemonBridgeClient) {
+							await this.wsServer.clearRemoteDocumentChanges();
+						} else {
+							this.wsServer.clearDocumentChanges();
+						}
 					}
 
 					return {
@@ -1870,6 +2128,7 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			{},
 			async () => {
 				try {
+					await this.refreshBridgeStatus(true);
 					if (!this.wsServer?.isClientConnected()) {
 						// Fall back to browser manager if available
 						if (this.browserManager) {
@@ -6388,145 +6647,19 @@ return {
 				// Non-critical — stable dir is a convenience feature
 			}
 
-			// Start WebSocket bridge server with port range fallback.
-			// If the preferred port is taken (e.g., Claude Desktop Chat tab already bound it),
-			// try subsequent ports in the range (9223-9232) so multiple instances can coexist.
-			const wsHost = process.env.FIGMA_WS_HOST || 'localhost';
 			this.wsPreferredPort = parseInt(process.env.FIGMA_WS_PORT || String(DEFAULT_WS_PORT), 10);
-
-			// Clean up stale/orphaned MCP server instances before trying to bind.
-			// Phase 1: Remove stale port files and terminate zombie processes that have port files
-			cleanupStalePortFiles();
-			// Phase 2: Deep scan for orphaned processes holding ports WITHOUT port files
-			// (e.g., old instances from before port file tracking, or files already cleaned up)
-			cleanupOrphanedProcesses(this.wsPreferredPort);
-
-			const portsToTry = getPortRange(this.wsPreferredPort);
-			let boundPort: number | null = null;
-
-			for (const port of portsToTry) {
-				try {
-					this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
-					await this.wsServer.start();
-
-					// Get the actual bound port (should match, but verify)
-					const addr = this.wsServer.address();
-					boundPort = addr?.port ?? port;
-					this.wsActualPort = boundPort;
-
-					if (boundPort !== this.wsPreferredPort) {
-						logger.info(
-							{ preferredPort: this.wsPreferredPort, actualPort: boundPort },
-							"Preferred WebSocket port was in use, bound to fallback port",
-						);
-					} else {
-						logger.info({ wsPort: boundPort }, "WebSocket bridge server started");
-					}
-
-					// Advertise the port so the Figma plugin and other tools can discover us
-					advertisePort(boundPort, wsHost);
-					registerPortCleanup(boundPort);
-
-					// Start heartbeat — periodically refresh the port file to prove this server is active.
-					// Other instances use this to detect zombie processes on startup.
-					const heartbeatPort = boundPort;
-					this.wsHeartbeatTimer = setInterval(() => refreshPortAdvertisement(heartbeatPort), HEARTBEAT_INTERVAL_MS);
-					this.wsHeartbeatTimer.unref(); // Don't prevent process exit
-
-					break;
-				} catch (wsError) {
-					const errorMsg = wsError instanceof Error ? wsError.message : String(wsError);
-					const errorCode = wsError instanceof Error ? (wsError as any).code : undefined;
-
-					if (errorCode === "EADDRINUSE" || errorMsg.includes("EADDRINUSE")) {
-						logger.debug(
-							{ port, error: errorMsg },
-							"Port in use, trying next in range",
-						);
-						this.wsServer = null;
-						continue;
-					}
-
-					// Non-port-conflict error — don't try more ports
-					logger.warn(
-						{ error: errorMsg, port },
-						"Failed to start WebSocket bridge server",
-					);
-					this.wsServer = null;
-					break;
-				}
-			}
-
-			// Phase 3: If all ports exhausted, try evicting the oldest instance and retry ONCE
-			if (!boundPort && evictOldestInstance(this.wsPreferredPort)) {
-				for (const port of portsToTry) {
-					try {
-						this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
-						await this.wsServer.start();
-						const addr = this.wsServer.address();
-						boundPort = addr?.port ?? port;
-						this.wsActualPort = boundPort;
-						logger.info(
-							{ wsPort: boundPort, eviction: true },
-							"WebSocket bridge server started after evicting stale instance",
-						);
-						advertisePort(boundPort, wsHost);
-						registerPortCleanup(boundPort);
-						const heartbeatPort = boundPort;
-						this.wsHeartbeatTimer = setInterval(() => refreshPortAdvertisement(heartbeatPort), HEARTBEAT_INTERVAL_MS);
-						this.wsHeartbeatTimer.unref();
-						break;
-					} catch (wsError) {
-						const errorCode = wsError instanceof Error ? (wsError as any).code : undefined;
-						if (errorCode === "EADDRINUSE") {
-							this.wsServer = null;
-							continue;
-						}
-						this.wsServer = null;
-						break;
-					}
-				}
-			}
-
-			if (!boundPort) {
-				this.wsStartupError = {
-					code: "EADDRINUSE",
-					port: this.wsPreferredPort,
-				};
-				const rangeEnd = this.wsPreferredPort + portsToTry.length - 1;
-				logger.warn(
-					{ portRange: `${this.wsPreferredPort}-${rangeEnd}` },
-					"All WebSocket ports in range are in use — running without WebSocket transport",
+			this.wsServer = new DaemonBridgeClient();
+			const ownership = await this.ensurePreferredBridgeOwnership("startup");
+			if (ownership === "started" || ownership === "taken_over") {
+				logger.info(
+					{ wsPort: this.wsActualPort, ownership, socketPath: getDaemonSocketPath() },
+					"Bridge daemon is available for this MCP session",
 				);
-			}
-
-			if (this.wsServer) {
-				// Log when plugin files connect/disconnect (with file identity)
-				this.wsServer.on("fileConnected", (data: { fileKey: string; fileName: string }) => {
-					logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin connected via WebSocket");
-				});
-				this.wsServer.on("fileDisconnected", (data: { fileKey: string; fileName: string }) => {
-					logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin disconnected from WebSocket");
-				});
-
-				// Invalidate variable cache when document changes are reported.
-				// Figma's documentchange API doesn't expose a specific variable change type —
-				// variable operations manifest as node PROPERTY_CHANGE events, so we invalidate
-				// on any style or node change to be safe.
-				this.wsServer.on("documentChange", (data: any) => {
-					if (data.hasStyleChanges || data.hasNodeChanges) {
-						if (data.fileKey) {
-							// Per-file cache invalidation — only clear the affected file's cache
-							this.variablesCache.delete(data.fileKey);
-						} else {
-							this.variablesCache.clear();
-						}
-						logger.debug(
-							{ fileKey: data.fileKey, changeCount: data.changeCount, hasStyleChanges: data.hasStyleChanges, hasNodeChanges: data.hasNodeChanges },
-							"Variable cache invalidated due to document changes"
-						);
-					}
-				});
+			} else {
+				logger.warn(
+					{ preferredPort: this.wsPreferredPort, socketPath: getDaemonSocketPath() },
+					"Bridge daemon is not available yet; bridge-dependent tools will report setup guidance",
+				);
 			}
 
 			// Check if Figma Desktop is accessible (non-blocking, just for logging)
@@ -6566,18 +6699,7 @@ return {
 		logger.info("Shutting down MCP server...");
 
 		try {
-			// Stop heartbeat timer
-			if (this.wsHeartbeatTimer) {
-				clearInterval(this.wsHeartbeatTimer);
-				this.wsHeartbeatTimer = null;
-			}
-
-			// Clean up port advertisement before stopping the server
-			if (this.wsActualPort) {
-				unadvertisePort(this.wsActualPort);
-			}
-
-			if (this.wsServer) {
+			if (this.wsServer?.stop) {
 				await this.wsServer.stop();
 			}
 
@@ -6592,6 +6714,131 @@ return {
 			logger.info("MCP server shutdown complete");
 		} catch (error) {
 			logger.error({ error }, "Error during shutdown");
+		}
+	}
+}
+
+function getBridgeDaemonEntrypoint(): string {
+	const currentFile = fileURLToPath(import.meta.url);
+	const packageRoot = dirname(dirname(currentFile));
+	return resolve(packageRoot, "dist", "bridge-daemon.js");
+}
+
+function runLaunchctl(args: string[]): void {
+	execFileSync("launchctl", args, {
+		stdio: "ignore",
+		timeout: 5000,
+	});
+}
+
+function writeLaunchAgentPlist(): string {
+	const plistPath = getLaunchAgentPath();
+	const daemonEntry = getBridgeDaemonEntrypoint();
+	const uid = process.getuid?.();
+	if (uid === undefined) {
+		throw new Error("macOS launchd setup requires process.getuid()");
+	}
+
+	mkdirSync(dirname(plistPath), { recursive: true });
+	mkdirSync(getDaemonLogDir(), { recursive: true });
+
+	const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${process.execPath}</string>
+    <string>${daemonEntry}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${getDaemonStdoutPath()}</string>
+  <key>StandardErrorPath</key>
+  <string>${getDaemonStderrPath()}</string>
+</dict>
+</plist>
+`;
+
+	writeFileSync(plistPath, plist, "utf8");
+	try {
+		runLaunchctl(["bootout", `gui/${uid}/${DAEMON_LABEL}`]);
+	} catch {
+		// Existing agent may not be loaded yet.
+	}
+	runLaunchctl(["bootstrap", `gui/${uid}`, plistPath]);
+	runLaunchctl(["kickstart", "-k", `gui/${uid}/${DAEMON_LABEL}`]);
+	return plistPath;
+}
+
+function uninstallLaunchAgent(): void {
+	const uid = process.getuid?.();
+	if (uid === undefined) return;
+	try {
+		runLaunchctl(["bootout", `gui/${uid}/${DAEMON_LABEL}`]);
+	} catch {
+		// Agent may not be loaded yet.
+	}
+}
+
+async function runDaemonCommand(command: "install-daemon" | "daemon-status" | "daemon-restart" | "daemon-uninstall"): Promise<void> {
+	if (process.platform !== "darwin") {
+		throw new Error("Daemon management commands are currently supported on macOS only.");
+	}
+
+	switch (command) {
+		case "install-daemon": {
+			const plistPath = writeLaunchAgentPlist();
+			console.log(JSON.stringify({
+				status: "installed",
+				label: DAEMON_LABEL,
+				plistPath,
+				socketPath: getDaemonSocketPath(),
+				logDir: getDaemonLogDir(),
+			}, null, 2));
+			return;
+		}
+		case "daemon-status": {
+			const client = new DaemonBridgeClient();
+			const status = await client.refreshStatus(true);
+			console.log(JSON.stringify({
+				label: DAEMON_LABEL,
+				running: !!status,
+				socketPath: getDaemonSocketPath(),
+				port: status?.address?.port ?? null,
+				pluginConnected: status?.isClientConnected ?? false,
+				files: status?.connectedFiles ?? [],
+			}, null, 2));
+			return;
+		}
+		case "daemon-restart": {
+			const uid = process.getuid?.();
+			if (uid === undefined) {
+				throw new Error("process.getuid() is unavailable");
+			}
+			runLaunchctl(["kickstart", "-k", `gui/${uid}/${DAEMON_LABEL}`]);
+			console.log(JSON.stringify({
+				status: "restarted",
+				label: DAEMON_LABEL,
+			}, null, 2));
+			return;
+		}
+		case "daemon-uninstall": {
+			uninstallLaunchAgent();
+			const plistPath = getLaunchAgentPath();
+			if (existsSync(plistPath)) {
+				rmSync(plistPath, { force: true });
+			}
+			console.log(JSON.stringify({
+				status: "uninstalled",
+				label: DAEMON_LABEL,
+				plistPath,
+			}, null, 2));
 		}
 	}
 }
@@ -6626,9 +6873,21 @@ const currentFile = fileURLToPath(import.meta.url);
 const entryFile = process.argv[1] ? realpathSync(resolve(process.argv[1])) : "";
 
 if (currentFile === entryFile) {
+	let handledCliCommand = false;
+	const daemonCommand = process.argv.find((arg) =>
+		["install-daemon", "daemon-status", "daemon-restart", "daemon-uninstall"].includes(arg),
+	) as "install-daemon" | "daemon-status" | "daemon-restart" | "daemon-uninstall" | undefined;
+	if (daemonCommand) {
+		handledCliCommand = true;
+		runDaemonCommand(daemonCommand).catch((error) => {
+			console.error("Daemon command failed:", error instanceof Error ? error.message : String(error));
+			process.exit(1);
+		}).then(() => process.exit(0));
+	}
+
 	// Handle --print-path: print the Desktop Bridge manifest path and exit.
 	// MUST always print a path and exit — never fall through to main().
-	if (process.argv.includes("--print-path")) {
+	if (!handledCliCommand && process.argv.includes("--print-path")) {
 		try {
 			const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 			const sourceDir = resolve(packageRoot, "figma-desktop-bridge");
@@ -6664,10 +6923,12 @@ if (currentFile === entryFile) {
 		}
 	}
 
-	main().catch((error) => {
-		console.error("Fatal error:", error);
-		process.exit(1);
-	});
+	if (!handledCliCommand) {
+		main().catch((error) => {
+			console.error("Fatal error:", error);
+			process.exit(1);
+		});
+	}
 }
 
 export { LocalFigmaConsoleMCP };

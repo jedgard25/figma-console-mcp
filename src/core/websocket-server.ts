@@ -25,7 +25,7 @@ import type { ConsoleLogEntry } from './types/index.js';
 
 // Read version from package.json using the resolved package root.
 // PACKAGE_ROOT uses import.meta.url in ESM (production) and __dirname in CJS (Jest).
-let SERVER_VERSION = '0.0.0';
+export let SERVER_VERSION = '0.0.0';
 try {
   SERVER_VERSION = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8')).version;
 } catch {
@@ -62,6 +62,8 @@ const logger = createChildLogger({ component: 'websocket-server' });
 export interface WebSocketServerOptions {
   port: number;
   host?: string;
+  preferredPort?: number;
+  ownerLeaseId?: string;
 }
 
 interface PendingRequest {
@@ -79,7 +81,21 @@ export interface ConnectedFileInfo {
   currentPage?: string;
   currentPageId?: string;
   editorType?: 'figma' | 'figjam' | 'dev';
+  pluginVersion?: string;
   connectedAt: number;
+}
+
+export interface ConnectionStateSnapshot {
+  connectionState: 'connecting' | 'connected' | 'retrying' | 'taken_over' | 'disconnected' | 'stale';
+  pluginVersion?: string;
+  serverVersion: string;
+  ownerPid: number;
+  ownerLeaseId?: string;
+  serverPort: number;
+  preferredPort: number;
+  lastHeartbeatAt?: number;
+  lastDisconnectReason?: string;
+  takeoverAvailable: boolean;
 }
 
 export interface SelectionInfo {
@@ -115,6 +131,9 @@ export interface ClientConnection {
   consoleLogs: ConsoleLogEntry[];
   lastActivity: number;
   lastPongAt: number;
+  connectionState: ConnectionStateSnapshot['connectionState'];
+  lastHeartbeatAt: number;
+  lastDisconnectReason: string | null;
   gracePeriodTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -138,6 +157,7 @@ export class FigmaWebSocketServer extends EventEmitter {
   private _pluginUIContent: string | null = null;
   /** Heartbeat interval for detecting dead connections via ping/pong */
   private _heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private _lastDisconnectReason: string | null = null;
 
   constructor(options: WebSocketServerOptions) {
     super();
@@ -287,6 +307,12 @@ export class FigmaWebSocketServer extends EventEmitter {
                 pid: process.pid,
                 serverVersion: SERVER_VERSION,
                 startedAt: this._startedAt,
+                preferredPort: this.options.preferredPort ?? this.options.port,
+                ownerLeaseId: this.options.ownerLeaseId,
+                ownershipStatus: (this.options.port === (this.options.preferredPort ?? this.options.port))
+                  ? 'owner'
+                  : 'compatibility_fallback',
+                takeoverAvailable: this.options.port !== (this.options.preferredPort ?? this.options.port),
               },
             }));
           } catch {
@@ -335,6 +361,7 @@ export class FigmaWebSocketServer extends EventEmitter {
             const found = this.findClientByWs(ws);
             if (found) {
               found.client.lastPongAt = Date.now();
+              found.client.lastHeartbeatAt = Date.now();
             }
           });
         });
@@ -393,6 +420,19 @@ export class FigmaWebSocketServer extends EventEmitter {
       // FILE_INFO promotes pending clients to named clients
       if (message.type === 'FILE_INFO' && message.data) {
         this.handleFileInfo(message.data, ws);
+      }
+
+      if (message.type === 'CONNECTION_STATE' && message.data) {
+        const found = this.findClientByWs(ws);
+        if (found) {
+          found.client.connectionState = message.data.connectionState || found.client.connectionState;
+          found.client.lastHeartbeatAt = message.data.timestamp || Date.now();
+          if (message.data.lastDisconnectReason) {
+            found.client.lastDisconnectReason = message.data.lastDisconnectReason;
+            this._lastDisconnectReason = message.data.lastDisconnectReason;
+          }
+          found.client.lastActivity = Date.now();
+        }
       }
 
       // Buffer document changes for the specific file
@@ -525,6 +565,7 @@ export class FigmaWebSocketServer extends EventEmitter {
         currentPage: data.currentPage,
         currentPageId: data.currentPageId || null,
         editorType: data.editorType || 'figma',
+        pluginVersion: data.pluginVersion,
         connectedAt: Date.now(),
       },
       selection: existing?.selection || null,
@@ -532,6 +573,9 @@ export class FigmaWebSocketServer extends EventEmitter {
       consoleLogs: existing?.consoleLogs || [],
       lastActivity: Date.now(),
       lastPongAt: Date.now(),
+      connectionState: 'connected',
+      lastHeartbeatAt: Date.now(),
+      lastDisconnectReason: null,
       gracePeriodTimer: null,
     });
 
@@ -583,6 +627,9 @@ export class FigmaWebSocketServer extends EventEmitter {
       { fileKey, fileName: client.fileInfo.fileName, code, reason },
       'File disconnected from WebSocket'
     );
+    client.lastDisconnectReason = reason || null;
+    client.connectionState = 'disconnected';
+    this._lastDisconnectReason = reason || null;
 
     // Start grace period — keep state but clean up if not reconnected
     client.gracePeriodTimer = setTimeout(() => {
@@ -872,6 +919,63 @@ export class FigmaWebSocketServer extends EventEmitter {
     if (!this._activeFileKey) return null;
     const client = this.clients.get(this._activeFileKey);
     return client?.lastPongAt ?? null;
+  }
+
+  getActiveClientConnectionState(): ConnectionStateSnapshot['connectionState'] | null {
+    if (!this._activeFileKey) return null;
+    const client = this.clients.get(this._activeFileKey);
+    return client?.connectionState ?? null;
+  }
+
+  getActiveClientPluginVersion(): string | null {
+    if (!this._activeFileKey) return null;
+    const client = this.clients.get(this._activeFileKey);
+    return client?.fileInfo?.pluginVersion ?? null;
+  }
+
+  getLastDisconnectReason(): string | null {
+    if (this._activeFileKey) {
+      const client = this.clients.get(this._activeFileKey);
+      if (client?.lastDisconnectReason) return client.lastDisconnectReason;
+    }
+    return this._lastDisconnectReason;
+  }
+
+  getConnectionSnapshot(): ConnectionStateSnapshot | null {
+    if (!this._activeFileKey) return null;
+
+    const client = this.clients.get(this._activeFileKey);
+    const addr = this.address();
+    if (!client || !addr) return null;
+
+    return {
+      connectionState: client.connectionState,
+      pluginVersion: client.fileInfo.pluginVersion,
+      serverVersion: SERVER_VERSION,
+      ownerPid: process.pid,
+      ownerLeaseId: this.options.ownerLeaseId,
+      serverPort: addr.port,
+      preferredPort: this.options.preferredPort ?? addr.port,
+      lastHeartbeatAt: client.lastHeartbeatAt || client.lastPongAt,
+      lastDisconnectReason: client.lastDisconnectReason || undefined,
+      takeoverAvailable: addr.port !== (this.options.preferredPort ?? addr.port),
+    };
+  }
+
+  requestClientReconnect(scanRange = false): Promise<any> {
+    return this.sendCommand('REQUEST_RECONNECT', { scanRange }, 10000);
+  }
+
+  requestClientRescan(): Promise<any> {
+    return this.sendCommand('REQUEST_RESCAN', {}, 10000);
+  }
+
+  requestClientReloadUi(): Promise<any> {
+    return this.sendCommand('REQUEST_UI_RELOAD', {}, 10000);
+  }
+
+  requestClientTakeover(): Promise<any> {
+    return this.sendCommand('REQUEST_TAKEOVER', {}, 10000);
   }
 
   /**
