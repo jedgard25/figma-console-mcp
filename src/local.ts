@@ -6677,9 +6677,9 @@ return {
 
 			logger.info("MCP server started successfully on stdio transport");
 
-			// 🆕 AUTO-CONNECT: Start monitoring immediately if Figma Desktop is available
-			// This enables "get latest logs" workflow without requiring manual setup
-			this.autoConnectToFigma();
+			if (process.env.FIGMA_ENABLE_LEGACY_CDP_AUTOCONNECT === "true") {
+				this.autoConnectToFigma();
+			}
 		} catch (error) {
 			logger.error({ error }, "Failed to start MCP server");
 

@@ -220,11 +220,9 @@ export class DaemonBridgeClient implements BridgeController {
     try {
       return await this.requestOnce(request);
     } catch (error) {
-      if (!existsSync(this.socketPath)) {
-        kickstartDaemon();
-        return this.requestOnce(request);
-      }
-      throw error;
+      logger.debug({ error }, 'Bridge daemon request failed; kickstarting launchd and retrying once');
+      kickstartDaemon();
+      return this.requestOnce(request);
     }
   }
 
